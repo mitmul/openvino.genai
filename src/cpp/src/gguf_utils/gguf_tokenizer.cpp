@@ -38,6 +38,7 @@ bool is_gguf_model(const std::filesystem::path& file_path) {
     return file_path.extension() == ".gguf";
 }
 
+#ifdef ENABLE_GGUF
 std::map<std::string, GGUFMetaData> tokenizer_config_from_meta(
     const std::unordered_map<std::string, GGUFMetaData>& metadata) {
     std::map<std::string, GGUFMetaData> tokenizer_config;
@@ -54,6 +55,7 @@ std::map<std::string, GGUFMetaData> tokenizer_config_from_meta(
 
     return tokenizer_config;
 }
+#endif
 
 std::shared_ptr<void> load_shared_object(const std::filesystem::path& path) {
 #ifdef _WIN32
@@ -104,6 +106,7 @@ void* get_symbol(const std::shared_ptr<void>& shared_object, const char* symbolN
 #endif
 }
 
+#ifdef ENABLE_GGUF
 ov::OutputVector add_ragged_dimension(const ov::OutputVector& inputs) {
     auto input_shape = std::make_shared<v3::ShapeOf>(inputs[0], element::i32);
     auto const_zero = std::make_shared<v0::Constant>(element::i32, Shape{}, 0);
@@ -618,6 +621,7 @@ std::string patch_gguf_chat_template(const std::string& chat_template) {
 
     return patched_chat_template;
 }
+#endif
 
 }  // namespace genai
 }  // namespace ov

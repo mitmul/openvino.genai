@@ -3,6 +3,7 @@
 #include <openvino/opsets/opset15.hpp>
 #include <openvino/op/util/op_types.hpp>
 #include <openvino/core/model.hpp>
+#include <openvino/core/graph_util.hpp>
 #include <openvino/core/rt_info.hpp>
 #include <openvino/op/parameter.hpp>
 #include <openvino/op/constant.hpp>

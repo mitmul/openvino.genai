@@ -4,8 +4,18 @@
 #pragma once
 
 #include <filesystem>
+#include <map>
+#include <memory>
+#include <string>
+#include <tuple>
+#include <unordered_map>
 
+#include "openvino/core/any.hpp"
+#include "openvino/core/model.hpp"
+
+#ifdef ENABLE_GGUF
 #include "gguf.hpp"
+#endif
 
 using FactoryCreateType = ov::OutputVector (*)(const std::string& op_type,
                                                const ov::OutputVector& inputs,
@@ -15,16 +25,17 @@ namespace ov {
 namespace genai {
 bool is_gguf_model(const std::filesystem::path& file_path);
 
+std::shared_ptr<void> load_shared_object(const std::filesystem::path& path);
+
+void* get_symbol(const std::shared_ptr<void>& shared_object, const char* symbolName);
+
+#ifdef ENABLE_GGUF
 std::map<std::string, GGUFMetaData> tokenizer_config_from_meta(
     const std::unordered_map<std::string, GGUFMetaData>& metadata);
 
 std::tuple<std::shared_ptr<ov::Model>, std::shared_ptr<ov::Model>, std::map<std::string, GGUFMetaData>>
 create_tokenizer_from_config(const std::shared_ptr<void>& shared_object_ov_tokenizers,
                              const std::filesystem::path& gguf_model_path);
-
-std::shared_ptr<void> load_shared_object(const std::filesystem::path& path);
-
-void* get_symbol(const std::shared_ptr<void>& shared_object, const char* symbolName);
 
 template <typename T>
 const T* get_if_exist(const std::map<std::string, GGUFMetaData>& tokenizer_config, const std::string& attribute_name) {
@@ -57,6 +68,7 @@ const T* get_if_exist(const std::map<std::string, GGUFMetaData>& tokenizer_confi
  * pattern matched.
  */
 std::string patch_gguf_chat_template(const std::string& chat_template);
+#endif
 
 }  // namespace genai
 }  // namespace ov

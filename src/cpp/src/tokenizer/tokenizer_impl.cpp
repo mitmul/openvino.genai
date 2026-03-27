@@ -5,6 +5,7 @@
 
 #include <utility>
 
+#include "gguf_utils/gguf_tokenizer.hpp"
 #include "add_second_input_pass.hpp"
 #include "sampling/structured_output/structured_output_controller.hpp"
 #include "openvino/genai/version.hpp"
@@ -290,6 +291,7 @@ void Tokenizer::TokenizerImpl::setup_tokenizer(const std::filesystem::path& mode
     auto [filtered_properties, enable_save_ov_model] = utils::extract_gguf_properties(properties);
     
     if (ov::genai::is_gguf_model(models_path)) {
+#ifdef ENABLE_GGUF
         std::map<std::string, GGUFMetaData> tokenizer_config{};
         std::tie(ov_tokenizer, ov_detokenizer, tokenizer_config) =
             create_tokenizer_from_config(m_shared_object_ov_tokenizers, models_path);
@@ -333,6 +335,9 @@ void Tokenizer::TokenizerImpl::setup_tokenizer(const std::filesystem::path& mode
 
         setup_tokenizer(std::make_pair(ov_tokenizer, ov_detokenizer), filtered_properties);
         return;
+#else
+        OPENVINO_ASSERT(false, "GGUF support is switched off. Please, recompile with 'cmake -DENABLE_GGUF=ON'");
+#endif
     }
     if (std::filesystem::exists(models_path / "openvino_tokenizer.xml")) {
         ov_tokenizer = core.read_model(models_path / "openvino_tokenizer.xml", {}, std::as_const(filtered_properties));
