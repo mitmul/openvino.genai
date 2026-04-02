@@ -8,6 +8,11 @@
 namespace ov {
 namespace genai {
 
+struct FixedWindowInputsConfig {
+    size_t window_size = 0;
+    int64_t pad_token_id = 0;
+};
+
 ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     ov::InferRequest& m_llm,
     const ov::Tensor& input_ids,
@@ -22,7 +27,8 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     std::optional<int64_t> rope_delta = std::nullopt,
     const size_t max_kv_cache_size = std::numeric_limits<size_t>::max(),
     const bool use_intermediate_remote_tensor = true,
-    const std::unordered_map<std::string, ov::Tensor>& lm_extra_inputs = {});
+    const std::unordered_map<std::string, ov::Tensor>& lm_extra_inputs = {},
+    std::optional<FixedWindowInputsConfig> fixed_window_inputs = std::nullopt);
 
 
 void align_kv_cache_and_history(const ov::Tensor& new_chat_tokens, utils::KVCacheState& kv_cache_state);

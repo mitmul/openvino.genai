@@ -10,6 +10,64 @@
 
 #include "utils.hpp"
 
+namespace {
+
+size_t validate_fixed_window_runtime_contract(const std::shared_ptr<ov::Model>& model) {
+    OPENVINO_ASSERT(model, "FIXED_WINDOW_RUNTIME requires a valid model.");
+    OPENVINO_ASSERT(ov::genai::utils::has_input(model, "input_ids"),
+                    "FIXED_WINDOW_RUNTIME requires an input_ids input.");
+    OPENVINO_ASSERT(ov::genai::utils::has_input(model, "attention_mask"),
+                    "FIXED_WINDOW_RUNTIME requires an attention_mask input.");
+
+    const auto input_ids_shape = model->input("input_ids").get_partial_shape();
+    const auto attention_mask_shape = model->input("attention_mask").get_partial_shape();
+    OPENVINO_ASSERT(input_ids_shape.rank().is_static() && input_ids_shape.rank().get_length() == 2,
+                    "FIXED_WINDOW_RUNTIME requires rank-2 input_ids.");
+    OPENVINO_ASSERT(attention_mask_shape.rank().is_static() && attention_mask_shape.rank().get_length() == 2,
+                    "FIXED_WINDOW_RUNTIME requires rank-2 attention_mask.");
+    OPENVINO_ASSERT(input_ids_shape[0].is_static() && input_ids_shape[1].is_static(),
+                    "FIXED_WINDOW_RUNTIME requires static input_ids dimensions.");
+    OPENVINO_ASSERT(attention_mask_shape[0].is_static() && attention_mask_shape[1].is_static(),
+                    "FIXED_WINDOW_RUNTIME requires static attention_mask dimensions.");
+
+    const auto batch = static_cast<size_t>(input_ids_shape[0].get_length());
+    const auto window_size = static_cast<size_t>(input_ids_shape[1].get_length());
+    OPENVINO_ASSERT(batch == 1u,
+                    "FIXED_WINDOW_RUNTIME currently supports only batch size 1.");
+    OPENVINO_ASSERT(window_size > 1u,
+                    "FIXED_WINDOW_RUNTIME requires a sequence width greater than 1.");
+    OPENVINO_ASSERT(attention_mask_shape[0].get_length() == input_ids_shape[0].get_length() &&
+                    attention_mask_shape[1].get_length() == input_ids_shape[1].get_length(),
+                    "FIXED_WINDOW_RUNTIME requires attention_mask to match input_ids shape.");
+
+    if (ov::genai::utils::has_input(model, "position_ids")) {
+        const auto position_ids_shape = model->input("position_ids").get_partial_shape();
+        OPENVINO_ASSERT(position_ids_shape.rank().is_static() && position_ids_shape.rank().get_length() == 2,
+                        "FIXED_WINDOW_RUNTIME requires rank-2 position_ids when that input exists.");
+        OPENVINO_ASSERT(position_ids_shape[0].is_static() && position_ids_shape[1].is_static(),
+                        "FIXED_WINDOW_RUNTIME requires static position_ids dimensions.");
+        OPENVINO_ASSERT(position_ids_shape[0].get_length() == input_ids_shape[0].get_length() &&
+                        position_ids_shape[1].get_length() == input_ids_shape[1].get_length(),
+                        "FIXED_WINDOW_RUNTIME requires position_ids to match input_ids shape.");
+    }
+
+    return window_size;
+}
+
+int64_t resolve_fixed_window_pad_token_id(const ov::genai::Tokenizer& tokenizer) {
+    int64_t pad_token_id = tokenizer.get_pad_token_id();
+    if (pad_token_id != -1) {
+        return pad_token_id;
+    }
+    pad_token_id = tokenizer.get_eos_token_id();
+    if (pad_token_id != -1) {
+        return pad_token_id;
+    }
+    return 0;
+}
+
+}
+
 namespace ov::genai {
 
 StatefulLLMPipeline::StatefulLLMPipeline(
@@ -66,6 +124,7 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         m_kv_cache_state.seq_length_axis = kv_pos.seq_len;
 
     auto [filtered_properties_without_gguf, enable_save_ov_model] = utils::extract_gguf_properties(properties);
+    const bool use_fixed_window_runtime = utils::pop_or_default(filtered_properties_without_gguf, "FIXED_WINDOW_RUNTIME", false);
     auto filtered_properties = extract_adapters_from_properties(filtered_properties_without_gguf, &m_generation_config.adapters);
     if (m_generation_config.adapters) {
         m_generation_config.adapters->set_tensor_name_prefix("base_model.model.");
@@ -82,6 +141,14 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     }
     m_model_runner = compiled_model.create_infer_request();
     ov::genai::utils::print_compiled_model_properties(compiled_model, "Stateful LLM model");
+
+    if (use_fixed_window_runtime) {
+        OPENVINO_ASSERT(m_is_npu,
+                        "FIXED_WINDOW_RUNTIME is currently implemented only for the NPU stateful pipeline.");
+        m_fixed_window_size = validate_fixed_window_runtime_contract(model);
+        m_fixed_window_pad_token_id = resolve_fixed_window_pad_token_id(m_tokenizer);
+        m_use_fixed_window_runtime = true;
+    }
 
     // If eos_token_id was not provided, take value
     if (m_generation_config.eos_token_id == -1)
@@ -377,6 +444,13 @@ EncodedResults StatefulLLMPipeline::generate(
                     "(input_ids, attention_mask, position_ids, beam_idx) "
                     "but you have '" + std::to_string(num_inputs) + "' inputs");
 
+    std::optional<FixedWindowInputsConfig> fixed_window_inputs = std::nullopt;
+    if (m_use_fixed_window_runtime) {
+        OPENVINO_ASSERT(!is_chat_conversation,
+                        "FIXED_WINDOW_RUNTIME does not support chat mode.");
+        fixed_window_inputs = FixedWindowInputsConfig{m_fixed_window_size, m_fixed_window_pad_token_id};
+    }
+
     if (is_chat_conversation) {
         if (m_use_full_chat_history)
             reset_kv_state();
@@ -449,7 +523,8 @@ EncodedResults StatefulLLMPipeline::generate(
     }
 
     ov::genai::utils::GenerationFinishInfo finish_info = get_lm_encoded_results(m_model_runner, input_ids, concatenated_attention_mask, streamer_ptr, m_sampler,
-                                                                                requests, position_ids, std::nullopt, m_kv_cache_state, nullptr, std::nullopt, m_max_kv_cache_size);
+                                                                                requests, position_ids, std::nullopt, m_kv_cache_state, nullptr, std::nullopt, m_max_kv_cache_size,
+                                                                                true, {}, fixed_window_inputs);
     ov::genai::EncodedResults& result = finish_info.results;
     m_chat_generation_finish_status = finish_info.streaming_finish_status;
 

@@ -27,6 +27,9 @@ class StatefulLLMPipeline final : public LLMPipelineImplBase {
     size_t m_max_prompt_len = std::numeric_limits<size_t>::max();
     size_t m_max_kv_cache_size = std::numeric_limits<size_t>::max();
     bool m_is_npu = false;
+    bool m_use_fixed_window_runtime = false;
+    size_t m_fixed_window_size = 0;
+    int64_t m_fixed_window_pad_token_id = 0;
     // include reflection of tokens contained in the kv cache and amount of tokens, which are needed to trim from kv cache on the next step of chat
     utils::KVCacheState m_kv_cache_state;
 

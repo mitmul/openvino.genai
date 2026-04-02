@@ -15,6 +15,60 @@
 
 namespace {
 
+ov::Tensor left_pad_to_fixed_window(const ov::Tensor& source, size_t window_size, int64_t fill_value) {
+    const auto source_shape = source.get_shape();
+    OPENVINO_ASSERT(source_shape.size() == 2, "Fixed-window runtime expects rank-2 tensors.");
+    OPENVINO_ASSERT(source_shape[1] <= window_size,
+                    "Fixed-window runtime received prompt length ",
+                    source_shape[1],
+                    " for target window ",
+                    window_size,
+                    ".");
+
+    ov::Tensor padded{source.get_element_type(), {source_shape[0], window_size}};
+    std::fill_n(padded.data<int64_t>(), padded.get_size(), fill_value);
+
+    const size_t copy_width = source_shape[1];
+    const size_t dst_offset = window_size - copy_width;
+    for (size_t batch = 0; batch < source_shape[0]; ++batch) {
+        const int64_t* src = source.data<const int64_t>() + batch * copy_width;
+        int64_t* dst = padded.data<int64_t>() + batch * window_size + dst_offset;
+        std::copy_n(src, copy_width, dst);
+    }
+    return padded;
+}
+
+std::optional<ov::Tensor> build_fixed_window_prompt_position_ids(const std::optional<ov::Tensor>& position_ids,
+                                                                 const ov::Tensor& attention_mask) {
+    if (!position_ids.has_value()) {
+        return std::nullopt;
+    }
+    ov::Tensor padded_position_ids{ov::element::i64, attention_mask.get_shape()};
+    std::fill_n(padded_position_ids.data<int64_t>(), padded_position_ids.get_size(), 0);
+    return padded_position_ids;
+}
+
+void fill_fixed_window_decode_row(int64_t* input_ids_row,
+                                  int64_t* attention_mask_row,
+                                  int64_t* position_ids_row,
+                                  size_t window_size,
+                                  int64_t pad_token_id,
+                                  int64_t current_token_id,
+                                  size_t valid_past_tokens) {
+    std::fill_n(input_ids_row, window_size, pad_token_id);
+    std::fill_n(attention_mask_row, window_size, 0);
+    if (position_ids_row != nullptr) {
+        std::fill_n(position_ids_row, window_size, 0);
+    }
+
+    const size_t kept_past_tokens = std::min(valid_past_tokens, window_size - 1);
+    const size_t active_start = (window_size - 1) - kept_past_tokens;
+    input_ids_row[window_size - 1] = current_token_id;
+    std::fill(attention_mask_row + active_start, attention_mask_row + window_size, 1);
+
+    (void)valid_past_tokens;
+}
+
 /**
  * Set position ids tensor data for next token inference based on provided attention mask
  * Supports multi batch
@@ -86,8 +140,35 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     std::optional<int64_t> rope_delta,
     const size_t max_kv_cache_size,
     const bool use_intermediate_remote_tensor,
-    const std::unordered_map<std::string, ov::Tensor>& lm_extra_inputs
+    const std::unordered_map<std::string, ov::Tensor>& lm_extra_inputs,
+    std::optional<FixedWindowInputsConfig> fixed_window_inputs
 ) {
+    if (fixed_window_inputs.has_value()) {
+        OPENVINO_ASSERT(!m_embedding, "FIXED_WINDOW_RUNTIME does not support embeddings-based generation.");
+        OPENVINO_ASSERT(!token_type_ids.has_value(), "FIXED_WINDOW_RUNTIME does not support token_type_ids.");
+        OPENVINO_ASSERT(lm_extra_inputs.empty(), "FIXED_WINDOW_RUNTIME does not support extra LLM inputs.");
+        OPENVINO_ASSERT(input_ids.get_shape().size() == 2 && attention_mask.get_shape().size() == 2,
+                        "FIXED_WINDOW_RUNTIME expects rank-2 input_ids and attention_mask.");
+        OPENVINO_ASSERT(input_ids.get_shape() == attention_mask.get_shape(),
+                        "FIXED_WINDOW_RUNTIME expects input_ids and attention_mask to have matching shapes.");
+        OPENVINO_ASSERT(input_ids.get_shape()[0] == 1,
+                        "FIXED_WINDOW_RUNTIME currently supports only batch size 1.");
+        OPENVINO_ASSERT(input_ids.get_shape()[1] <= fixed_window_inputs->window_size,
+                        "Prompt length ",
+                        input_ids.get_shape()[1],
+                        " exceeds the configured fixed window size ",
+                        fixed_window_inputs->window_size,
+                        ".");
+        OPENVINO_ASSERT(fixed_window_inputs->window_size >= 2,
+                        "FIXED_WINDOW_RUNTIME requires a window size of at least 2.");
+        OPENVINO_ASSERT(fixed_window_inputs->pad_token_id >= 0,
+                        "FIXED_WINDOW_RUNTIME requires a non-negative pad token id.");
+        OPENVINO_ASSERT(!position_ids.has_value() || position_ids->get_shape().size() == 2,
+                        "FIXED_WINDOW_RUNTIME supports only rank-2 position_ids.");
+        OPENVINO_ASSERT(!rope_delta.has_value(),
+                        "FIXED_WINDOW_RUNTIME does not support rope_delta-driven 3D position_ids.");
+    }
+
     std::vector<GenerationHandle> generations;
     for (SequenceGroup::Ptr sequence_group : sequence_groups) {
         generations.push_back(std::make_shared<GenerationHandleImpl>(sequence_group->get_generation_stream(), sequence_group->get_sampling_parameters()));
@@ -109,11 +190,13 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
         }
     };
 
-    auto free_non_running_requests = [&streamer_ptr, &generations, &active_sequence_groups, &max_kv_cache_size]() {
-        for (auto& sg : active_sequence_groups) {
-            for (auto& seq : sg->get_sequences()) {
-                if (sg->get_prompt_len() + seq->get_generated_len() - 1 == max_kv_cache_size) {
-                    seq->set_status(SequenceStatus::OUT_OF_MEMORY);
+    auto free_non_running_requests = [&streamer_ptr, &generations, &active_sequence_groups, &max_kv_cache_size, &fixed_window_inputs]() {
+        if (!fixed_window_inputs.has_value()) {
+            for (auto& sg : active_sequence_groups) {
+                for (auto& seq : sg->get_sequences()) {
+                    if (sg->get_prompt_len() + seq->get_generated_len() - 1 == max_kv_cache_size) {
+                        seq->set_status(SequenceStatus::OUT_OF_MEMORY);
+                    }
                 }
             }
         }
@@ -134,9 +217,17 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     raw_perf_counters.m_inference_durations = {{ MicroSeconds(0.0f) }};
 
     // Initialize inputs
+    ov::Tensor model_input_ids = input_ids;
+    ov::Tensor model_attention_mask = attention_mask;
+    std::optional<ov::Tensor> model_position_ids = position_ids;
+    if (fixed_window_inputs.has_value()) {
+        model_input_ids = left_pad_to_fixed_window(input_ids, fixed_window_inputs->window_size, fixed_window_inputs->pad_token_id);
+        model_attention_mask = left_pad_to_fixed_window(attention_mask, fixed_window_inputs->window_size, 0);
+        model_position_ids = build_fixed_window_prompt_position_ids(position_ids, model_attention_mask);
+    }
 
     if (m_embedding) {
-        m_llm.set_tensor("inputs_embeds", input_ids);
+        m_llm.set_tensor("inputs_embeds", model_input_ids);
         if (token_type_ids.has_value())
             m_llm.set_tensor("token_type_ids", *token_type_ids);
         // Set extra inputs for LLM if any
@@ -144,12 +235,14 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
             m_llm.set_tensor(name, tensor);
         }
     } else {
-        kv_cache_state.add_inputs(input_ids);
-        m_llm.set_tensor("input_ids", input_ids);
+        if (!fixed_window_inputs.has_value()) {
+            kv_cache_state.add_inputs(input_ids);
+        }
+        m_llm.set_tensor("input_ids", model_input_ids);
     }
-    m_llm.set_tensor("attention_mask", attention_mask);
-    if (position_ids.has_value())
-        m_llm.set_tensor("position_ids", *position_ids);
+    m_llm.set_tensor("attention_mask", model_attention_mask);
+    if (model_position_ids.has_value())
+        m_llm.set_tensor("position_ids", *model_position_ids);
 
     ov::Tensor beam_idx = ov::Tensor(ov::element::i32, {batch_size});
     std::fill_n(beam_idx.data<int32_t>(), batch_size, 0);
@@ -195,8 +288,27 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
             total_num_tokens += sequence_group->get_num_scheduled_tokens() * num_sequences;
         }
 
-        ov::Tensor new_input_ids(ov::element::i64, {total_num_tokens, 1});
+        const size_t step_width = fixed_window_inputs.has_value() ? fixed_window_inputs->window_size : 1;
+        ov::Tensor new_input_ids(ov::element::i64, {total_num_tokens, step_width});
         int64_t * input_ids_data = new_input_ids.data<int64_t>();
+        if (fixed_window_inputs.has_value()) {
+            std::fill_n(input_ids_data, new_input_ids.get_size(), fixed_window_inputs->pad_token_id);
+        }
+
+        std::optional<ov::Tensor> fixed_attention_mask = std::nullopt;
+        std::optional<ov::Tensor> fixed_position_ids = std::nullopt;
+        int64_t* fixed_attention_mask_data = nullptr;
+        int64_t* fixed_position_ids_data = nullptr;
+        if (fixed_window_inputs.has_value()) {
+            fixed_attention_mask = ov::Tensor(ov::element::i64, {total_num_tokens, step_width});
+            fixed_attention_mask_data = fixed_attention_mask->data<int64_t>();
+            std::fill_n(fixed_attention_mask_data, fixed_attention_mask->get_size(), 0);
+            if (position_ids.has_value()) {
+                fixed_position_ids = ov::Tensor(ov::element::i64, {total_num_tokens, step_width});
+                fixed_position_ids_data = fixed_position_ids->data<int64_t>();
+                std::fill_n(fixed_position_ids_data, fixed_position_ids->get_size(), 0);
+            }
+        }
 
         std::vector<int32_t> next_beams;
         size_t current_batch_size = 0;
@@ -212,15 +324,37 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
             for (size_t seq_id = 0; seq_id < num_running_sequences; ++seq_id) {
                 Sequence::CPtr sequence = running_sequences[seq_id];
 
-                for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id) {
-                    // compute token for current sequence
-                    input_ids_data[token_id] = position_id < sequence_group->get_prompt_len() ?
-                        sequence_group->get_prompt_ids()[position_id] :
-                        sequence->get_generated_ids()[position_id - sequence_group->get_prompt_len()];
+                if (fixed_window_inputs.has_value()) {
+                    OPENVINO_ASSERT(num_scheduled_tokens == 1u,
+                                    "FIXED_WINDOW_RUNTIME expects one scheduled token per decode step.");
+                    const auto& generated_ids = sequence->get_generated_ids();
+                    OPENVINO_ASSERT(!generated_ids.empty(),
+                                    "FIXED_WINDOW_RUNTIME requires at least one generated token before decode.");
+                    const size_t valid_past_tokens = sequence_group->get_prompt_len() + sequence->get_generated_len() - 1;
+                    fill_fixed_window_decode_row(input_ids_data,
+                                                 fixed_attention_mask_data,
+                                                 fixed_position_ids_data,
+                                                 step_width,
+                                                 fixed_window_inputs->pad_token_id,
+                                                 generated_ids.back(),
+                                                 valid_past_tokens);
+                } else {
+                    for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id) {
+                        // compute token for current sequence
+                        input_ids_data[token_id] = position_id < sequence_group->get_prompt_len() ?
+                            sequence_group->get_prompt_ids()[position_id] :
+                            sequence->get_generated_ids()[position_id - sequence_group->get_prompt_len()];
+                    }
                 }
 
                 // apply strides to shift to a next sequence
-                input_ids_data += num_scheduled_tokens;
+                input_ids_data += step_width;
+                if (fixed_window_inputs.has_value()) {
+                    fixed_attention_mask_data += step_width;
+                    if (fixed_position_ids_data != nullptr) {
+                        fixed_position_ids_data += step_width;
+                    }
+                }
 
                 // for different sequences iteration of beams started from 0, but we collect it to one input_ids
                 next_beams.push_back(beam_idxs[sequence->get_id()] + beam_offets.at(sequence_group->get_request_id()));
@@ -263,20 +397,38 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
             m_llm.set_tensor("input_ids", new_input_ids);
         }
 
-        // we don't need to keep state for non chat mode and for beam_search in chat mode
-        // in case of beam_search in chat mode, kv cache contains info about longest generated result among all sequences
-        // last answer will be removed from kv_cache and will be included to the prompt on the next step
-        if (new_input_ids.get_size() == 1)
-            kv_cache_state.add_inputs(new_input_ids);
-
-        update_attention_mask_with_beams(m_llm.get_tensor("attention_mask"), next_beams);
-
-        if (position_ids.has_value()) {
-            if (position_ids->get_shape().size() == 3 && rope_delta.has_value()) {
-                update_3d_position_ids(m_llm.get_tensor("position_ids"), m_llm.get_tensor("attention_mask"), rope_delta.value());
-            } else {
-                update_position_ids(m_llm.get_tensor("position_ids"), m_llm.get_tensor("attention_mask"));
+        if (fixed_window_inputs.has_value()) {
+            m_llm.set_tensor("attention_mask", *fixed_attention_mask);
+            if (fixed_position_ids.has_value()) {
+                m_llm.set_tensor("position_ids", *fixed_position_ids);
             }
+        } else {
+            // we don't need to keep state for non chat mode and for beam_search in chat mode
+            // in case of beam_search in chat mode, kv cache contains info about longest generated result among all sequences
+            // last answer will be removed from kv_cache and will be included to the prompt on the next step
+            if (new_input_ids.get_size() == 1)
+                kv_cache_state.add_inputs(new_input_ids);
+
+            update_attention_mask_with_beams(m_llm.get_tensor("attention_mask"), next_beams);
+
+            if (position_ids.has_value()) {
+                if (position_ids->get_shape().size() == 3 && rope_delta.has_value()) {
+                    update_3d_position_ids(m_llm.get_tensor("position_ids"), m_llm.get_tensor("attention_mask"), rope_delta.value());
+                } else {
+                    update_position_ids(m_llm.get_tensor("position_ids"), m_llm.get_tensor("attention_mask"));
+                }
+            }
+        }
+
+        if (fixed_window_inputs.has_value()) {
+            OPENVINO_ASSERT(fixed_attention_mask.has_value(),
+                            "FIXED_WINDOW_RUNTIME failed to build the decode attention_mask.");
+            OPENVINO_ASSERT(next_beams.size() == total_num_tokens,
+                            "FIXED_WINDOW_RUNTIME expects one beam entry per decode row.");
+            OPENVINO_ASSERT(current_batch_size == total_num_tokens,
+                            "FIXED_WINDOW_RUNTIME expects one scheduled token per running sequence.");
+            OPENVINO_ASSERT(!position_ids.has_value() || fixed_position_ids.has_value(),
+                            "FIXED_WINDOW_RUNTIME failed to produce decode position_ids.");
         }
 
         m_llm.set_tensor("beam_idx", ov::Tensor{ov::element::i32, {total_num_tokens}, next_beams.data()});
