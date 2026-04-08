@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "utils.hpp"
@@ -14,6 +16,19 @@
 #include "openvino/genai/streamer_base.hpp"
 
 namespace {
+
+bool fixed_window_replay_enabled() {
+    const char* env = std::getenv("OPENVINO_GENAI_FIXED_WINDOW_REPLAY");
+    if (env == nullptr) {
+        return false;
+    }
+
+    std::string value{env};
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
 
 ov::Tensor left_pad_to_fixed_window(const ov::Tensor& source, size_t window_size, int64_t fill_value) {
     const auto source_shape = source.get_shape();
@@ -43,8 +58,24 @@ std::optional<ov::Tensor> build_fixed_window_prompt_position_ids(const std::opti
     if (!position_ids.has_value()) {
         return std::nullopt;
     }
+
+    const auto source_shape = position_ids->get_shape();
+    const auto padded_shape = attention_mask.get_shape();
+    OPENVINO_ASSERT(source_shape.size() == 2 && padded_shape.size() == 2,
+                    "FIXED_WINDOW_RUNTIME expects rank-2 prompt position_ids.");
+    OPENVINO_ASSERT(source_shape[0] == padded_shape[0] && source_shape[1] <= padded_shape[1],
+                    "FIXED_WINDOW_RUNTIME received incompatible prompt position_ids shape.");
+
     ov::Tensor padded_position_ids{ov::element::i64, attention_mask.get_shape()};
     std::fill_n(padded_position_ids.data<int64_t>(), padded_position_ids.get_size(), 0);
+    const size_t copy_width = source_shape[1];
+    const size_t padded_width = padded_shape[1];
+    const size_t dst_offset = padded_width - copy_width;
+    for (size_t batch = 0; batch < source_shape[0]; ++batch) {
+        const int64_t* src = position_ids->data<const int64_t>() + batch * copy_width;
+        int64_t* dst = padded_position_ids.data<int64_t>() + batch * padded_width + dst_offset;
+        std::copy_n(src, copy_width, dst);
+    }
     return padded_position_ids;
 }
 
@@ -65,8 +96,44 @@ void fill_fixed_window_decode_row(int64_t* input_ids_row,
     const size_t active_start = (window_size - 1) - kept_past_tokens;
     input_ids_row[window_size - 1] = current_token_id;
     std::fill(attention_mask_row + active_start, attention_mask_row + window_size, 1);
+    if (position_ids_row != nullptr) {
+        for (size_t idx = 0; idx < kept_past_tokens; ++idx) {
+            position_ids_row[active_start + idx] = static_cast<int64_t>(valid_past_tokens - kept_past_tokens + idx);
+        }
+        position_ids_row[window_size - 1] = static_cast<int64_t>(valid_past_tokens);
+    }
 
     (void)valid_past_tokens;
+}
+
+void fill_fixed_window_replay_row(int64_t* input_ids_row,
+                                  int64_t* attention_mask_row,
+                                  int64_t* position_ids_row,
+                                  size_t window_size,
+                                  int64_t pad_token_id,
+                                  const ov::genai::TokenIds& prompt_ids,
+                                  const ov::genai::TokenIds& generated_ids) {
+    std::fill_n(input_ids_row, window_size, pad_token_id);
+    std::fill_n(attention_mask_row, window_size, 0);
+    if (position_ids_row != nullptr) {
+        std::fill_n(position_ids_row, window_size, 0);
+    }
+
+    const size_t total_tokens = prompt_ids.size() + generated_ids.size();
+    const size_t kept_tokens = std::min(total_tokens, window_size);
+    const size_t skip_tokens = total_tokens - kept_tokens;
+    const size_t dst_offset = window_size - kept_tokens;
+
+    for (size_t idx = 0; idx < kept_tokens; ++idx) {
+        const size_t source_index = skip_tokens + idx;
+        const int64_t token_id = source_index < prompt_ids.size() ? prompt_ids[source_index]
+                                                                  : generated_ids[source_index - prompt_ids.size()];
+        input_ids_row[dst_offset + idx] = token_id;
+        attention_mask_row[dst_offset + idx] = 1;
+        if (position_ids_row != nullptr) {
+            position_ids_row[dst_offset + idx] = static_cast<int64_t>(idx);
+        }
+    }
 }
 
 /**
@@ -278,6 +345,8 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
 
     // "Generation" phase
 
+    const bool use_fixed_window_replay = fixed_window_inputs.has_value() && fixed_window_replay_enabled();
+
     while (!active_sequence_groups.empty()) {
         size_t total_num_tokens = 0;
 
@@ -325,19 +394,29 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
                 Sequence::CPtr sequence = running_sequences[seq_id];
 
                 if (fixed_window_inputs.has_value()) {
-                    OPENVINO_ASSERT(num_scheduled_tokens == 1u,
-                                    "FIXED_WINDOW_RUNTIME expects one scheduled token per decode step.");
-                    const auto& generated_ids = sequence->get_generated_ids();
-                    OPENVINO_ASSERT(!generated_ids.empty(),
-                                    "FIXED_WINDOW_RUNTIME requires at least one generated token before decode.");
-                    const size_t valid_past_tokens = sequence_group->get_prompt_len() + sequence->get_generated_len() - 1;
-                    fill_fixed_window_decode_row(input_ids_data,
-                                                 fixed_attention_mask_data,
-                                                 fixed_position_ids_data,
-                                                 step_width,
-                                                 fixed_window_inputs->pad_token_id,
-                                                 generated_ids.back(),
-                                                 valid_past_tokens);
+                    if (use_fixed_window_replay) {
+                        fill_fixed_window_replay_row(input_ids_data,
+                                                     fixed_attention_mask_data,
+                                                     fixed_position_ids_data,
+                                                     step_width,
+                                                     fixed_window_inputs->pad_token_id,
+                                                     sequence_group->get_prompt_ids(),
+                                                     sequence->get_generated_ids());
+                    } else {
+                        OPENVINO_ASSERT(num_scheduled_tokens == 1u,
+                                        "FIXED_WINDOW_RUNTIME expects one scheduled token per decode step.");
+                        const auto& generated_ids = sequence->get_generated_ids();
+                        OPENVINO_ASSERT(!generated_ids.empty(),
+                                        "FIXED_WINDOW_RUNTIME requires at least one generated token before decode.");
+                        const size_t valid_past_tokens = sequence_group->get_prompt_len() + sequence->get_generated_len() - 1;
+                        fill_fixed_window_decode_row(input_ids_data,
+                                                     fixed_attention_mask_data,
+                                                     fixed_position_ids_data,
+                                                     step_width,
+                                                     fixed_window_inputs->pad_token_id,
+                                                     generated_ids.back(),
+                                                     valid_past_tokens);
+                    }
                 } else {
                     for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id) {
                         // compute token for current sequence
@@ -357,7 +436,7 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
                 }
 
                 // for different sequences iteration of beams started from 0, but we collect it to one input_ids
-                next_beams.push_back(beam_idxs[sequence->get_id()] + beam_offets.at(sequence_group->get_request_id()));
+                next_beams.push_back(use_fixed_window_replay ? 0 : (beam_idxs[sequence->get_id()] + beam_offets.at(sequence_group->get_request_id())));
             }
 
             current_batch_size += num_running_sequences;
@@ -365,6 +444,12 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
 
         for (size_t i = 0; i < active_sequence_groups.size(); i++) {
             beam_offets[active_sequence_groups.at(i)->get_request_id()] = i == 0 ? 0 : (active_sequence_groups.at(i - 1)->num_running_seqs() + beam_offets[i - 1]);
+        }
+
+        if (use_fixed_window_replay) {
+            OPENVINO_ASSERT(total_num_tokens == 1u,
+                            "OPENVINO_GENAI_FIXED_WINDOW_REPLAY currently supports only single-sequence generation.");
+            m_llm.reset_state();
         }
 
         if (m_embedding) {
@@ -425,7 +510,7 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
                             "FIXED_WINDOW_RUNTIME failed to build the decode attention_mask.");
             OPENVINO_ASSERT(next_beams.size() == total_num_tokens,
                             "FIXED_WINDOW_RUNTIME expects one beam entry per decode row.");
-            OPENVINO_ASSERT(current_batch_size == total_num_tokens,
+            OPENVINO_ASSERT(use_fixed_window_replay || current_batch_size == total_num_tokens,
                             "FIXED_WINDOW_RUNTIME expects one scheduled token per running sequence.");
             OPENVINO_ASSERT(!position_ids.has_value() || fixed_position_ids.has_value(),
                             "FIXED_WINDOW_RUNTIME failed to produce decode position_ids.");
