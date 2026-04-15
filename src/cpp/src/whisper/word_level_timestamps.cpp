@@ -450,7 +450,7 @@ void truncate_long_words_at_sentence_boundaries(std::vector<ov::genai::WhisperWo
     median_duration = std::min(0.7f, median_duration);
     float max_duration = median_duration * 2.0f;
 
-    const std::string sentence_end_marks = ".。!！?？";
+    const std::string sentence_end_marks = ".\xE3\x80\x82!\xEF\xBC\x81?\xEF\xBC\x9F";
     for (size_t i = 1; i < words.size(); ++i) {
         float duration = words[i].end_ts - words[i].start_ts;
         if (duration > max_duration) {
@@ -469,8 +469,8 @@ std::vector<ov::genai::WhisperWordTiming> merge_punctuations(std::vector<ov::gen
         return words;
     }
 
-    const std::string prepend_punctuations = "\"'“¿([{-";
-    const std::string append_punctuations = "\"'.。,，!！?？:：”)]}、";
+    const std::string prepend_punctuations = "\\\"'\xE2\x80\x9C\xC2\xBF([{-";
+    const std::string append_punctuations = "\\\"'.\xE3\x80\x82,\xEF\xBC\x8C!\xEF\xBC\x81?\xEF\xBC\x9F:\xEF\xBC\x9A\xE2\x80\x9D)]}\xE3\x80\x81";
 
     // merge prepended punctuations
     size_t i = words.size() - 2;

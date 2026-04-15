@@ -35,6 +35,10 @@ project(OpenVINOGenAI
         HOMEPAGE_URL "https://github.com/openvinotoolkit/openvino.genai"
         LANGUAGES CXX C)
 
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 if(NOT DEFINED Python3_FIND_VIRTUALENV)
     set(Python3_FIND_VIRTUALENV FIRST)
 endif()
